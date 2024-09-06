@@ -1,0 +1,4 @@
+@aave/core-v3/contracts=lib/aave-v3-core/contracts/
+@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/
+@uniswap/v3-core/contracts=lib/v3-core/contracts/
+@uniswap/v3-periphery/contracts=lib/v3-periphery/contracts/
