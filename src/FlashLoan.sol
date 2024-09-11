@@ -49,9 +49,9 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
         address _tokenB,
         uint256 _amount
     ) public {
-        tokenB = _tokenB;
-        tokenA = _tokenA;
-        POOL.flashLoanSimple(address(this), _tokenA, _amount, "", 0);
+        tokenA = _tokenB;
+        tokenB = _tokenA;
+        POOL.flashLoanSimple(address(this), _tokenB, _amount, "", 0);
     }
 
     function executeOperation(
@@ -72,6 +72,7 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
         );
         // Repaying the loan
         uint256 totalAmount = amount + premium;
+        
         IERC20(asset).approve(address(POOL), totalAmount);
 
         return true;
@@ -120,8 +121,8 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
 
         INonfungiblePositionManager.MintParams
             memory params = INonfungiblePositionManager.MintParams({
-                token0: _tokenA,
-                token1: _tokenB,
+                token0: _tokenB,
+                token1: _tokenA,
                 fee: poolFee,
                 tickLower: int24(-887272),
                 tickUpper: int24(887272),
