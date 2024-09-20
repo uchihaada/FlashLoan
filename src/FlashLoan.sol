@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: MIT
-pragma solidity >=0.8.0;
+pragma solidity 0.8.26;
 
+import "forge-std/Test.sol";
 import "@aave/core-v3/contracts/interfaces/IPoolAddressesProvider.sol";
-// import "@aave/core-v3/contracts/dependencies/openzeppelin/contracts/IERC20.sol";
 import "@aave/core-v3/contracts/flashloan/base/FlashLoanSimpleReceiverBase.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "@uniswap/v3-periphery/contracts/libraries/TransferHelper.sol";
-
 import "@uniswap/v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
+import "@demeter-protocol/contracts/e721-farms/uniswapV3/UniV3FarmDeployer.sol";
+import "@demeter-protocol/contracts/e721-farms/uniswapV3/UniV3Farm.sol";
+import "@demeter-protocol/contracts/Farm.sol";
 
-// import "@uniswap/v3-core/contracts/libraries/TickMath.sol";
-
-// import "@uniswap/v3-periphery/contracts/base/LiquidityManagement.sol";
-
-contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
+contract SimpleFlashLoan is FlashLoanSimpleReceiverBase, IERC721Receiver {
     address payable owner;
     ISwapRouter public swapRouter;
     address public tokenA;
@@ -22,8 +20,14 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
     uint24 public poolFee;
     uint256 swapAmountOut;
     uint public tokenId;
-
+    uint256 public amount0ToMint;
+    uint256 public amount1ToMint;
+    Farm public farm;
+    UniV3FarmDeployer public farmDeployer;
+    address public tokenAddress;
+    address public tokenManager;
     INonfungiblePositionManager public nonfungiblePositionManager;
+    uint256 public depositId;
 
     struct Deposit {
         address owner;
@@ -31,6 +35,20 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
         address token0;
         address token1;
     }
+
+    struct UniswapPoolData {
+        address tokenA;
+        address tokenB;
+        uint24 feeTier;
+        int24 tickLowerAllowed;
+        int24 tickUpperAllowed;
+    }
+
+    struct RewardTokenData {
+        address token;
+        address tknManager;
+    }
+
     mapping(uint256 => Deposit) public deposits;
 
     constructor(
@@ -44,14 +62,18 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
         poolFee = _fee;
     }
 
-    function fn_RequestFlashLoan(
+    function requestFlashLoan(
         address _tokenA,
         address _tokenB,
-        uint256 _amount
+        uint256 _amount,
+        uint256 _amount0ToMint,
+        uint256 _amount1ToMint
     ) public {
-        tokenA = _tokenB;
-        tokenB = _tokenA;
-        POOL.flashLoanSimple(address(this), _tokenB, _amount, "", 0);
+        tokenA = _tokenA;
+        tokenB = _tokenB;
+        amount0ToMint = _amount0ToMint;
+        amount1ToMint = _amount1ToMint;
+        POOL.flashLoanSimple(address(this), tokenB, _amount, "", 0);
     }
 
     function executeOperation(
@@ -61,21 +83,86 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
         address initiator,
         bytes calldata params
     ) external override returns (bool) {
-        //swapping tokens
-        swapAmountOut = swap(asset, tokenB, amount / 2);
-        //deposit both tokens in a v3 pool
+        // Swapping tokens
+        swapAmountOut = swap(asset, tokenA, amount / 2);
+
+        // Deposit both tokens into the Uniswap v3 pool
         (uint256 _tokenId, uint256 _liquidity) = depositInPool(
             tokenA,
             tokenB,
             amount / 2,
             swapAmountOut
         );
-        // Repaying the loan
+
+        // Creating a UniswapPoolData instance
+        UniswapPoolData memory uniswapPoolData = UniswapPoolData({
+            tokenA: tokenA,
+            tokenB: tokenB,
+            feeTier: poolFee,
+            tickLowerAllowed: int24(-887272),
+            tickUpperAllowed: int24(887272)
+        });
+
+        // Preparing reward data array
+        RewardTokenData[] memory rewardData;
+        rewardData[0] = RewardTokenData({
+            token: tokenAddress,
+            tknManager: tokenManager
+        });
+        rewardData[1] = RewardTokenData({
+            token: address(0),
+            tknManager: address(0)
+        });
+
+        // Calling createUniFarm
+        address deployedFarm = createUniFarm(
+            address(this),
+            block.timestamp,
+            block.timestamp + 300,
+            uniswapPoolData,
+            rewardData
+        );
+        depositInFarm(deployedFarm, _tokenId);
+
+        //withdraw
+        farm.withdraw(depositId);
+
+        //withdraw from uniswap pool
+        withdrawFromPool(_tokenId);
+
+        // Repaying the flash loan
         uint256 totalAmount = amount + premium;
-        
         IERC20(asset).approve(address(POOL), totalAmount);
 
         return true;
+    }
+
+    function createUniFarm(
+        address _farmAdmin,
+        uint256 _farmStartTime,
+        uint256 _cooldownPeriod,
+        UniswapPoolData memory _uniswapPoolData,
+        RewardTokenData[] memory _rewardData
+    ) public returns (address) {
+        address newFarm = farmDeployer.createFarm(
+            UniV3FarmDeployer.FarmData({
+                farmAdmin: _farmAdmin,
+                farmStartTime: _farmStartTime,
+                cooldownPeriod: _cooldownPeriod,
+                uniswapPoolData: _uniswapPoolData,
+                rewardData: _rewardData
+            })
+        );
+        return newFarm;
+    }
+
+    function depositInFarm(address _farm, uint256 _tokenId) public {
+        require(tokenId != 0, "No LP token to deposit");
+        nonfungiblePositionManager.safeTransferFrom(
+            address(this),
+            address(_farm),
+            _tokenId
+        );
     }
 
     function swap(
@@ -106,8 +193,6 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
         uint256 amount0,
         uint256 amount1
     ) internal returns (uint256 _tokenId, uint128 liquidity) {
-        uint256 amount1ToMint = 1 * 1e18;
-        uint256 amount0ToMint = 1 * 1e6;
         TransferHelper.safeApprove(
             _tokenA,
             address(nonfungiblePositionManager),
@@ -121,8 +206,8 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
 
         INonfungiblePositionManager.MintParams
             memory params = INonfungiblePositionManager.MintParams({
-                token0: _tokenB,
-                token1: _tokenA,
+                token0: _tokenA,
+                token1: _tokenB,
                 fee: poolFee,
                 tickLower: int24(-887272),
                 tickUpper: int24(887272),
@@ -138,7 +223,7 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
             .mint(params);
         _createDeposit(msg.sender, _tokenId);
 
-        // Remove allowance and refund in both assets.
+        // Remove allowance and refund excess tokens
         if (amount0 < amount0ToMint) {
             TransferHelper.safeApprove(
                 _tokenA,
@@ -158,7 +243,37 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
             uint refund1 = amount1ToMint - amount1;
             TransferHelper.safeTransfer(_tokenB, msg.sender, refund1);
         }
+
         return (_tokenId, liquidity);
+    }
+
+    function withdrawFromPool(uint256 _tokenId) internal {
+        INonfungiblePositionManager.DecreaseLiquidityParams
+            memory decreaseParams = INonfungiblePositionManager
+                .DecreaseLiquidityParams({
+                    tokenId: _tokenId,
+                    liquidity: deposits[_tokenId].liquidity,
+                    amount0Min: 0,
+                    amount1Min: 0,
+                    deadline: block.timestamp
+                });
+
+        (uint256 amount0, uint256 amount1) = nonfungiblePositionManager
+            .decreaseLiquidity(decreaseParams);
+
+        INonfungiblePositionManager.CollectParams
+            memory collectParams = INonfungiblePositionManager.CollectParams({
+                tokenId: _tokenId,
+                recipient: address(this),
+                amount0Max: type(uint128).max,
+                amount1Max: type(uint128).max
+            });
+
+        (
+            uint256 collectedAmount0,
+            uint256 collectedAmount1
+        ) = nonfungiblePositionManager.collect(collectParams);
+
     }
 
     function _createDeposit(address _owner, uint256 _tokenId) internal {
@@ -177,8 +292,6 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
 
         ) = nonfungiblePositionManager.positions(_tokenId);
 
-        // set the owner and data for position
-        // operator is msg.sender
         deposits[_tokenId] = Deposit({
             owner: _owner,
             liquidity: liquidity,
@@ -194,10 +307,8 @@ contract SimpleFlashLoan is FlashLoanSimpleReceiverBase {
         address,
         uint256 _tokenId,
         bytes calldata
-    ) external returns (bytes4) {
-        // get position information
+    ) external override returns (bytes4) {
         _createDeposit(operator, _tokenId);
-
         return this.onERC721Received.selector;
     }
 
